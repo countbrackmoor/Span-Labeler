@@ -1989,6 +1989,32 @@
   }
 
 
+
+  /* === DEMO MODE === */
+  .demo-banner {
+    display: none;
+    align-items: center;
+    gap: 12px;
+    padding: 7px 20px;
+    background: #1a1200;
+    border-bottom: 1px solid #3a2a00;
+    font-size: 11px;
+    color: #c4a35a;
+    font-family: 'JetBrains Mono', monospace;
+    flex-shrink: 0;
+  }
+  .demo-banner.visible { display: flex; }
+  .demo-banner-label {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 10px;
+    background: #c4a35a;
+    color: #000;
+    padding: 2px 7px;
+    border-radius: 2px;
+  }
+
   /* === REVIEW MODE === */
   .review-banner {
     display: flex;
@@ -2592,6 +2618,12 @@
       <button class="btn primary" id="btn-categories">Manage Labels</button>
     </div>
   </header>
+
+  <!-- Demo mode banner -->
+  <div class="demo-banner" id="demo-banner">
+    <span class="demo-banner-label">Demo</span>
+    <span>You are in demo mode. Changes are saved to a separate demo file and do not affect production data.</span>
+  </div>
 
   <!-- Review mode banner — hidden by default -->
   <div id="review-banner" class="review-banner" style="display:none;">
@@ -5260,6 +5292,72 @@ document.addEventListener('click', (e) => {
 });
 
 // ---- main metrics renderer ----
+function fmtDuration(seconds) {
+  if (!seconds || seconds < 1) return '0m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return h + 'h ' + (m > 0 ? m + 'm' : '');
+  if (m > 0) return m + 'm';
+  return seconds + 's';
+}
+
+function _todayStr() { return new Date().toISOString().slice(0, 10); }
+function _weekAgoStr() {
+  const d = new Date(); d.setDate(d.getDate() - 7);
+  return d.toISOString().slice(0, 10);
+}
+
+async function loadDatasetTimeTracking(datasetId) {
+  const el = document.getElementById('time-tracking-body');
+  if (!el) return;
+  try {
+    const resp = await fetch(_url('tracking'), { credentials: 'include' });
+    if (!resp.ok) { el.innerHTML = '<div style="color:var(--ink-3); font-size:12px;">Time data is admin-only.</div>'; return; }
+    const data = await resp.json();
+    const records = (data.records || []).filter(r => r.datasetId === datasetId);
+    renderTimeTable(el, records);
+  } catch(e) {
+    el.innerHTML = '<div style="color:var(--accent); font-size:12px;">Failed to load time data.</div>';
+    console.error('loadDatasetTimeTracking error:', e);
+  }
+}
+
+function renderTimeTable(el, records) {
+  if (records.length === 0) {
+    el.innerHTML = '<div style="color:var(--ink-3); font-size:12px;">No time recorded yet.</div>';
+    return;
+  }
+  const today = _todayStr();
+  const weekAgo = _weekAgoStr();
+  const byAnnotator = {};
+  records.forEach(r => {
+    if (!byAnnotator[r.annotatorId]) byAnnotator[r.annotatorId] = { today:0, week:0, total:0, spans:0 };
+    const a = byAnnotator[r.annotatorId];
+    a.total += r.activeSeconds; a.spans += r.spansCreated;
+    if (r.date === today) a.today += r.activeSeconds;
+    if (r.date >= weekAgo) a.week += r.activeSeconds;
+  });
+  const rows = Object.entries(byAnnotator).sort((a,b)=>b[1].total-a[1].total).map(([id,a]) => {
+    const avg = a.spans > 0 ? fmtDuration(Math.round(a.total / a.spans)) : '—';
+    return `<tr>
+      <td class="mono">${escapeHtml(id)}</td>
+      <td class="right mono">${fmtDuration(a.today)}</td>
+      <td class="right mono">${fmtDuration(a.week)}</td>
+      <td class="right mono">${fmtDuration(a.total)}</td>
+      <td class="right mono">${a.spans}</td>
+      <td class="right mono">${avg}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <table class="metrics-table">
+      <thead><tr>
+        <th>Annotator</th><th class="right">Today</th><th class="right">This week</th>
+        <th class="right">Total</th><th class="right">Spans</th><th class="right">Avg/span</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 function renderMetrics() {
   const ds = activeDataset();
   const body = document.getElementById('metrics-body');
@@ -6128,8 +6226,19 @@ async function bootApp() {
     currentUser = me;
     hideLoginScreen();
     updateUserChip();
+    // Show demo banner if server is in demo mode
+    if (me.demoMode) {
+      document.getElementById('demo-banner').classList.add('visible');
+    }
     await bootDatasets();
   } else {
+    // Also check for demo meta tag (means server is in demo mode but cookie not yet set)
+    const demoMeta = document.querySelector('meta[name="onespan-demo"]');
+    if (demoMeta) {
+      // Reload to pick up the demo session cookie the server just set
+      window.location.reload();
+      return;
+    }
     showLoginScreen();
   }
 }

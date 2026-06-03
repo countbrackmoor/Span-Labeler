@@ -36,7 +36,11 @@ DATA_FILE     = Path(os.environ.get("DATA_FILE",     "dataset.json"))
 USERS_FILE    = Path(os.environ.get("USERS_FILE",    "users.json"))
 SESSIONS_FILE = Path(os.environ.get("SESSIONS_FILE", "sessions.json"))
 TRACKING_FILE = Path(os.environ.get("TRACKING_FILE", "tracking.json"))
-SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "settings.json"))
+SETTINGS_FILE  = Path(os.environ.get("SETTINGS_FILE",  "settings.json"))
+DEMO_DATA_FILE = Path(os.environ.get("DEMO_DATA_FILE", "demo_dataset.json"))
+
+DEMO_MODE  = os.environ.get("DEMO_MODE", "false").lower() in ("true", "1", "yes")
+DEMO_TOKEN = "demo-session-token-onespan"
 HTML_FILE     = Path(os.environ.get("HTML_FILE",     "index.html"))
 ADMIN_PASSWORD= os.environ.get("ADMIN_PASSWORD", "spann3r$")
 
@@ -146,7 +150,11 @@ def _delete_session(token: str) -> None:
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
+_DEMO_SESSION = {"username": "demo", "role": "admin"}
+
 def _require_session(request: Request) -> dict:
+    if DEMO_MODE and request.cookies.get("onespan_session") == DEMO_TOKEN:
+        return _DEMO_SESSION
     token = request.cookies.get("onespan_session")
     session = _get_session(token)
     if not session:
@@ -210,6 +218,11 @@ async def lifespan(app: FastAPI):
     ]:
         if not path.exists():
             _write_json(path, default)
+    if DEMO_MODE:
+        if not DEMO_DATA_FILE.exists():
+            _write_json(DEMO_DATA_FILE, {"datasets": [], "activeDatasetId": None})
+        print(f"[onespan] *** DEMO MODE ENABLED ***")
+        print(f"[onespan] Demo data: {DEMO_DATA_FILE.resolve()}")
     _ensure_admin()
     print(f"[onespan] Listening: http://0.0.0.0:{PORT}/")
     yield
@@ -235,10 +248,17 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 @app.get("", response_class=HTMLResponse)
-async def serve_ui():
+async def serve_ui(response: Response):
     if not HTML_FILE.exists():
         raise HTTPException(status_code=404, detail=f"index.html not found at {HTML_FILE.resolve()}")
-    return HTMLResponse(content=HTML_FILE.read_text(encoding="utf-8"))
+    html = HTML_FILE.read_text(encoding="utf-8")
+    if DEMO_MODE:
+        html = html.replace("</head>",
+            '  <meta name="onespan-demo" content="true">\n</head>', 1)
+        response.set_cookie(
+            key="onespan_session", value=DEMO_TOKEN,
+            httponly=True, samesite="lax", max_age=60*60*24)
+    return HTMLResponse(content=html)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +305,9 @@ async def logout(request: Request, response: Response):
 
 @app.get("/auth/me")
 async def me(request: Request):
+    if DEMO_MODE and request.cookies.get("onespan_session") == DEMO_TOKEN:
+        return {"username": "demo", "role": "admin",
+                "annotatorId": "demo", "datasets": "*", "demoMode": True}
     session = _require_session(request)
     users = _load_users()
     user = users.get(session["username"], {})
@@ -412,15 +435,18 @@ async def admin_set_datasets(username: str, request: Request):
 @app.get("/data/")
 async def get_data(request: Request):
     session = _require_session(request)
+    if DEMO_MODE and session["username"] == "demo":
+        try:
+            data = json.loads(DEMO_DATA_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"datasets": [], "activeDatasetId": None}
+        return JSONResponse(content=data)
     data = _read_data()
-
-    # Admin sees everything; annotators see only their assigned datasets
     if session["role"] != "admin":
         data["datasets"] = [
             d for d in data.get("datasets", [])
             if _user_can_access_dataset(session["username"], d["id"])
         ]
-
     return JSONResponse(content=data)
 
 
@@ -448,6 +474,15 @@ async def save_data(request: Request):
             if not _user_can_access_dataset(session["username"], ds["id"]):
                 raise HTTPException(status_code=403, detail=f"No access to dataset {ds['id']}")
         body["datasets"] = body["datasets"] + others
+
+    # Demo: write to demo_dataset.json only
+    if DEMO_MODE and session["username"] == "demo":
+        body.setdefault("activeDatasetId", None)
+        async with _file_lock:
+            _write_json(DEMO_DATA_FILE, body)
+        return JSONResponse({"ok": True, "demo": True,
+            "savedAt": datetime.now(timezone.utc).isoformat(),
+            "datasetCount": len(body.get("datasets", []))})
 
     body.setdefault("activeDatasetId", None)
     await _write_data(body)
